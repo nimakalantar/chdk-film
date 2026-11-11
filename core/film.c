@@ -221,11 +221,11 @@ static void build_grain_amp(int *amp, int amount, int range)
 }
 
 //-------------------------------------------------------------------
-// Raw buffer access (10 bit packed, 8 pixels per 10 bytes)
+// Raw buffer access: 10-bit = 8 pixels per 10 bytes, 12-bit = 4 pixels per 6 bytes
 
 #if CAM_SENSOR_BITS_PER_PIXEL == 10
 
-static inline void unpack8(const unsigned char *b, int *p)
+static inline void unpack_group(const unsigned char *b, int *p)
 {
     p[0] = (b[1] << 2) | (b[0] >> 6);
     p[1] = ((b[0] & 0x3F) << 4) | (b[3] >> 4);
@@ -237,7 +237,7 @@ static inline void unpack8(const unsigned char *b, int *p)
     p[7] = ((b[9] & 0x03) << 8) | b[8];
 }
 
-static inline void pack8(unsigned char *b, const int *p)
+static inline void pack_group(unsigned char *b, const int *p)
 {
     b[1] = p[0] >> 2;
     b[0] = (p[0] << 6) | (p[1] >> 4);
@@ -253,6 +253,32 @@ static inline void pack8(unsigned char *b, const int *p)
 
 #define GROUP_PIX   8
 #define GROUP_BYTES 10
+
+#elif CAM_SENSOR_BITS_PER_PIXEL == 12
+
+// 12-bit packed: 4 pixels per 6 bytes. Bit layout mirrors set_raw_pixel() in
+// core/raw.c -- pixel 0 and 2 keep their low nibble in the high nibble of
+// byte 0 and byte 5 respectively, pixel 1 and 3 keep their high nibble there.
+static inline void unpack_group(const unsigned char *b, int *p)
+{
+    p[0] = (b[1] << 4) | (b[0] >> 4);
+    p[1] = ((b[0] & 0x0F) << 8) | b[3];
+    p[2] = (b[2] << 4) | (b[5] >> 4);
+    p[3] = ((b[5] & 0x0F) << 8) | b[4];
+}
+
+static inline void pack_group(unsigned char *b, const int *p)
+{
+    b[1] = (unsigned char)(p[0] >> 4);
+    b[0] = (unsigned char)((p[0] & 0x0F) << 4) | (unsigned char)(p[1] >> 8);
+    b[3] = (unsigned char)p[1];
+    b[2] = (unsigned char)(p[2] >> 4);
+    b[5] = (unsigned char)((p[2] & 0x0F) << 4) | (unsigned char)(p[3] >> 8);
+    b[4] = (unsigned char)p[3];
+}
+
+#define GROUP_PIX   4
+#define GROUP_BYTES 6
 
 #endif
 
@@ -301,7 +327,7 @@ static void dev_light_end()
 
 void film_apply(void)
 {
-#if CAM_SENSOR_BITS_PER_PIXEL == 10
+#if CAM_SENSOR_BITS_PER_PIXEL == 10 || CAM_SENSOR_BITS_PER_PIXEL == 12
     const film_stock_t *s = current_stock();
     if (conf.film_stock == 0)
         return;
@@ -338,7 +364,7 @@ void film_apply(void)
     if (groups <= 0 || y1 <= y0)
         return;
 
-    int x, y, q[4], a[8], b[8];
+    int x, y, q[4], a[GROUP_PIX], b[GROUP_PIX];
 
     // Grey world white balance estimate on a sparse grid, skipping clipped and very dark quads
     unsigned sr = 0, sg = 0, sb = 0;
@@ -348,8 +374,8 @@ void film_apply(void)
         unsigned char *rb = ra + rowlen;
         for (x = x0; x < x1; x += 4)
         {
-            unpack8(ra + x*GROUP_BYTES, a);
-            unpack8(rb + x*GROUP_BYTES, b);
+            unpack_group(ra + x*GROUP_BYTES, a);
+            unpack_group(rb + x*GROUP_BYTES, b);
             q[0] = a[0]; q[1] = a[1]; q[2] = b[0]; q[3] = b[1];
             int r = q[iR] - black, g = ((q[iG1] + q[iG2]) >> 1) - black, bl = q[iB] - black;
             if (r < 16 || g < 16 || bl < 16) continue;
@@ -370,7 +396,7 @@ void film_apply(void)
     int amount = grain_amount();
     int gsize = grain_size();
     static int gamp[256];   // static: raw hook runs on a small task stack
-    int quads = groups * 4;
+    int quads = groups * (GROUP_PIX / 2);
     int *nrow = 0;
     if (amount > 0)
     {
@@ -429,10 +455,10 @@ void film_apply(void)
 
         for (x = 0; x < groups; x++, ra += GROUP_BYTES, rb += GROUP_BYTES)
         {
-            unpack8(ra, a);
-            unpack8(rb, b);
+            unpack_group(ra, a);
+            unpack_group(rb, b);
 
-            for (k = 0; k < 8; k += 2, qx++)
+            for (k = 0; k < GROUP_PIX; k += 2, qx++)
             {
                 q[0] = a[k]; q[1] = a[k+1]; q[2] = b[k]; q[3] = b[k+1];
 
@@ -495,8 +521,8 @@ void film_apply(void)
                 a[k] = q[0]; a[k+1] = q[1]; b[k] = q[2]; b[k+1] = q[3];
             }
 
-            pack8(ra, a);
-            pack8(rb, b);
+            pack_group(ra, a);
+            pack_group(rb, b);
         }
     }
 
